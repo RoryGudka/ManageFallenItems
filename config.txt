@@ -25,6 +25,5 @@ StopAtCarryWeight = false
 
 # Optional hotkey that opens the chest without casting (no runes spent), e.g. CTRL+G or F7. "none" = off.
 OpenKey = none
-
 # Development only.
 DevCommandFile = false

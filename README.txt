@@ -23,12 +23,10 @@ Install
   enabled.txt, so UE4SS loads it). Settings are in config.txt.
 
 Multiplayer
-  Everyone in the session needs the mod. The chest opens for whoever casts the spell, host or not.
-  Ground items belong to the host, so when someone else casts it, each action is carried out by the
-  host's copy of the mod and the items go into that player's own backpack. For them:
-    - the chest lists the fallen items their game knows about, which are the ones fairly near them;
-    - Ctrl+click (Transfer), hold X (Destroy) on a cell, and R (Take All) work as above;
-    - dragging and splitting do nothing (the cell stays as it was).
+  Everyone in the session needs the same version of the mod, including a dedicated server. The chest
+  opens for whoever casts the spell, host or not. Ground items belong to the host, so for anyone else
+  the host's copy of the mod builds their chest and sends it to their game; everything works as above.
+  The count on a cell is the total their game can see, which is the fallen items fairly near them.
 
 Uninstalling (important)
   A character that has this spell will not load without the mod: the game rejects saves that mention a

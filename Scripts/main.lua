@@ -24,8 +24,8 @@
 -- Collect: AddItemByData (capped by GetSpaceAvailableForItemByData) with the ground item's durability, then
 -- RemoveFromStack for a partial pickup or K2_DestroyActor for a whole one. Every add is measured.
 -- Masterwork-upgraded gear is left on the ground (its upgrades cannot be recreated); pick it up by hand.
--- Only the host can change ground items. A client's chest sends each action to the host's copy of the
--- mod, which carries it out on that client's backpack (see "Clients" below).
+-- Only the host can change ground items. In a world you join, the host's copy of the mod builds and runs
+-- your chest (see "Worlds you join" below).
 --
 -- Crash rules learned on this game (do not break them):
 --   * never call RuntimeSpawnedWorldItem:HandleInteraction or SetLifeSpan on a world item;
@@ -52,8 +52,7 @@ local cfg = {
     ProtectQuestItems = true,   -- destroying never destroys quest / key items
     VisibleRows = 5,            -- rows of cells shown before the chest scrolls (8 cells per row)
     StopAtCarryWeight = false,  -- Transfer / Take All stop before you would become encumbered (chests do not)
-    OpenKey = "none",           -- optional hotkey that opens the chest without casting, e.g. "CTRL+G"
-    DevCommandFile = false,     -- development only: run Mods/ManageFallenItems/cmd.lua when it changes
+    OpenKey = "none",           -- optional hotkey that opens the chest without casting, e.g. "CTRL+G"    DevCommandFile = false,     -- development only: run Mods/ManageFallenItems/cmd.lua when it changes
 }
 
 local function modRoot()
@@ -566,10 +565,11 @@ local CHEST = {
     keyAt = {}, slotKey = {}, placed = {}, rep = {}, byKey = {}, bag = {}, total = 0,
     nextScan = 0, dirty = false, ctrlAt = -10, xAt = -10, takeAllAt = -10,
     wrap = nil, panel = nil, pending = nil, painted = {},
-    client = false, forceClient = false, clickReq = false, takeAllReq = false, xCell = nil, xStart = 0, xSent = false,
+    client = false, forceClient = false, clickReq = false, takeAllReq = false, xNext = 0,
+    waitUntil = nil, known = nil, nextLook = 0,
+    remote = false, pawn = nil, retired = {}, last = nil, sentAt = 0,
 }
-local DESTROY_HOLD = 1.0
-local paintCounts
+local paintCounts, sendCtl
 
 local function compact(n)
     local function fmt(v, suffix)
@@ -661,37 +661,21 @@ local function unwrapScroll()
     pcall(function() w.place(w.kids, w.body) end)
 end
 
--- On a client the pawn belongs to the host, which ignores items added to a component on it, so the
--- chest goes on an actor spawned on this machine only (it has authority here and is never replicated).
-local function chestOwner(pawn)
-    if not CHEST.client then return pawn end
-    local a = nil
-    pcall(function()
-        local gs = StaticFindObject("/Script/Engine.Default__GameplayStatics")
-        a = gs:BeginDeferredActorSpawnFromClass(pawn, StaticFindObject("/Script/Engine.Actor"), XF, 1, nil, 0)
-        if valid(a) then gs:FinishSpawningActor(a, XF, 0) end
-    end)
-    return valid(a) and a or nil
-end
-
+-- A chest built for a player in a world they joined (CHEST.remote) replicates, so it reaches their game
+-- with its items and every inventory request their game sends about it names an object the host knows.
 local function newChest(pawn, slots)
-    local owner = chestOwner(pawn)
-    if not owner then return nil end
-    local c = owner:AddComponentByClass(StaticFindObject("/Script/Dominion.InventoryComponent"), true, XF, true)
+    local c = pawn:AddComponentByClass(StaticFindObject("/Script/Dominion.InventoryComponent"), true, XF, true)
     if not valid(c) then return nil end
     c.MaxSlotCount = slots
     c.bSupportsSortAndFillStacks = false
-    owner:FinishAddComponent(c, true, XF)
+    pawn:FinishAddComponent(c, true, XF)
+    if CHEST.remote then pcall(function() c:SetIsReplicated(true) end) end
     c.bAllowAdds = false
     return c
 end
 
 local function destroyChest(c)
-    if not valid(c) then return end
-    local owner = nil
-    pcall(function() owner = c:GetOwner() end)
-    pcall(function() c:K2_DestroyComponent(c) end)
-    if valid(owner) and className(owner) == "Actor" then pcall(function() owner:K2_DestroyActor() end) end
+    if valid(c) then pcall(function() c:K2_DestroyComponent(c) end) end
 end
 
 local function emptyChest(c)
@@ -748,17 +732,12 @@ local function syncSlot(i)
     if d and (not ours or extra > 0) then
         -- Items the mod did not put here (the game let them in) go on the ground at your feet, where
         -- they become fallen items like any other. Never deleted.
-        -- On a client the host never accepted the move, so the item is still in the backpack there.
         local amount = ours and extra or 0
-        if CHEST.client then
-            pcall(function() comp:RemoveFromSlot(i, ours and extra or n, nil) end)
-        else
-            pcall(function()
-                local l = pawnOf(CHEST.pc):K2_GetActorLocation()
-                local xf = { Rotation = XF.Rotation, Translation = { X = l.X, Y = l.Y, Z = l.Z }, Scale3D = XF.Scale3D }
-                comp:DropItem(i, xf, CHEST.pc, 0, { X = 0, Y = 0, Z = 0 }, amount, false)
-            end)
-        end
+        pcall(function()
+            local l = pawnOf(CHEST.pc):K2_GetActorLocation()
+            local xf = { Rotation = XF.Rotation, Translation = { X = l.X, Y = l.Y, Z = l.Z }, Scale3D = XF.Scale3D }
+            comp:DropItem(i, xf, CHEST.pc, 0, { X = 0, Y = 0, Z = 0 }, amount, false)
+        end)
         local _, d1, n1 = readSlot(comp, i)
         local left = ours and (n1 - (CHEST.placed[i] or 0)) or (d1 and n1 or 0)
         if left > 0 then log("could not move an item you put in the chest back out"); CHEST.placed[i] = n1; return end
@@ -796,28 +775,33 @@ local function chestTotal()
     return type(n) == "number" and n or 0
 end
 
+-- A client's chest belongs to the host: closing only tells the host, which empties and removes it.
 local function closeChest(fromGame)
     if CHEST.open and not fromGame and valid(CHEST.api) then
         pcall(function() CHEST.api:CloseCurrentInventory() end)
     end
-    if valid(CHEST.comp) then
+    if CHEST.client then
+        if CHEST.open or CHEST.waitUntil then pcall(sendCtl, "close") end
+    elseif valid(CHEST.comp) then
         pcall(function() CHEST.comp.bAllowAdds = true end)
         emptyChest(CHEST.comp)
     end
     pcall(paintCounts, true)
     unwrapScroll()
-    destroyChest(CHEST.comp)
-    CHEST.painted = {}
+    if not CHEST.client then destroyChest(CHEST.comp) end
+    CHEST.painted, CHEST.waitUntil, CHEST.known = {}, nil, nil
     CHEST.open, CHEST.comp, CHEST.compName, CHEST.api = false, nil, nil, nil
     CHEST.keyAt, CHEST.slotKey, CHEST.placed, CHEST.rep, CHEST.byKey, CHEST.bag = {}, {}, {}, {}, {}, {}
 end
 
 local refreshChest
 
--- Opens (or re-opens at a bigger size) the game's chest window on a fresh virtual chest.
+-- Opens (or re-opens at a bigger size) the game's chest window on a fresh virtual chest. For a remote
+-- chest there is no window here: the player's game opens it when it arrives, and a replaced chest is
+-- kept (empty) for a few seconds so their game can switch to the new one before the old one goes.
 local function showChest(groups)
-    local pawn = pawnOf(CHEST.pc)
-    if not (pawn and valid(CHEST.api)) then return false end
+    local pawn = CHEST.remote and CHEST.pawn or pawnOf(CHEST.pc)
+    if not (valid(pawn) and (CHEST.remote or valid(CHEST.api))) then return false end
     local old = CHEST.comp
     local comp = newChest(pawn, slotsFor(#groups))
     if not comp then log("could not create the chest"); return false end
@@ -825,21 +809,32 @@ local function showChest(groups)
     CHEST.slotKey, CHEST.placed, CHEST.rep = {}, {}, {}
     for k, i in pairs(CHEST.keyAt) do CHEST.slotKey[i] = k end
     if valid(old) then
-        unwrapScroll()
-        pcall(function() CHEST.api:CloseCurrentInventory() end)
+        if not CHEST.remote then
+            unwrapScroll()
+            pcall(function() CHEST.api:CloseCurrentInventory() end)
+        end
         pcall(function() old.bAllowAdds = true end)
         emptyChest(old)
-        destroyChest(old)
+        if CHEST.remote then
+            CHEST.retired[#CHEST.retired + 1] = { comp = old, at = os.clock() + 3 }
+        else
+            destroyChest(old)
+        end
     end
     refreshChest(groups)
-    pcall(function() CHEST.api:ToggleInventory(comp) end)
+    if not CHEST.remote then
+        pcall(function() CHEST.api:ToggleInventory(comp) end)
+        pcall(wrapScroll)
+    end
     CHEST.open = true
-    pcall(wrapScroll)
     return true
 end
 
+local clientRefresh
+
 -- Re-reads the ground and brings every cell in line with it.
 refreshChest = function(groups)
+    if CHEST.client then return clientRefresh() end
     groups = groups or scanGround(pawnOf(CHEST.pc))
     local byKey = {}
     for _, g in ipairs(groups) do byKey[g.key] = g end
@@ -887,7 +882,7 @@ local function settleChest()
     local takeAll = kinds > 1 or now - CHEST.takeAllAt < 1.0
     local transfer = now - CHEST.ctrlAt < 1.0
     local destroying = now - CHEST.xAt < 1.0
-    local collectKeys, destroyKeys = {}, {}
+    local collectKeys, destroyKeys, movedKeys, droppedKeys = {}, {}, {}, {}
     for key, c in pairs(gone) do
         local g = CHEST.byKey[key]
         local have = 0
@@ -922,13 +917,17 @@ local function settleChest()
             end
         end
         if moved then
+            movedKeys[key] = true
             if takeAll or transfer then collectKeys[key] = true end
-        elseif destroying and not protected then
-            destroyKeys[key] = true
+        else
+            droppedKeys[key] = true
+            if destroying and not protected then destroyKeys[key] = true end
         end
     end
     if next(collectKeys) then pcall(collectAll, pc, takeAll and nil or collectKeys) end
     if next(destroyKeys) then pcall(destroyAll, pc, destroyKeys) end
+    CHEST.last = { at = now, moved = movedKeys, dropped = droppedKeys,
+                   transfer = transfer or takeAll, takeAll = takeAll, destroy = destroying }
     refreshChest()
 end
 
@@ -1003,13 +1002,24 @@ local function fixTooltip()
     CHEST.ttCell, CHEST.ttH = nil, nil
 end
 
--- Clients ---------------------------------------------------------------------------------------------
--- Ground items belong to the host, so on a client the game refuses every move out of the chest. A client
--- reads the input instead (Ctrl+click or hold X on the cell under the mouse, R) and asks the host's copy
--- of the mod to do it, through the game's own pickup request: Server_RequestInteraction naming a ground
--- item's collision box but no interaction component. A real pickup always names its component, and the
--- game ignores a request without one, so only the mod acts on it. The two flags carry the action.
-local REQUEST_FLAGS = { transfer = { false, false }, destroy = { true, false }, takeAll = { false, true } }
+-- Worlds you join -------------------------------------------------------------------------------------
+-- Ground items belong to the host, and the game only moves items out of a chest the host knows. So in a
+-- world you join, the host's copy of the mod builds your chest (a replicated InventoryComponent on your
+-- character), keeps it in step with the ground and settles every move out of it as it does for its own
+-- chest; your game only opens it in the window. Every inventory request your game sends then names an
+-- object the host knows. (A chest the host cannot resolve fails the game's request validation, and the
+-- host disconnects the player.)
+--
+-- Messages to the host go through the game's own interaction request, Server_RequestInteraction, with no
+-- interaction component (the game ignores a request without one, so only the mod acts on it), naming the
+-- player's own capsule or mesh; the two flags carry the message. Ctrl+click, hold X and R reach the host
+-- as hints: the game's own move out of the chest says which item, the hint says to take or destroy the
+-- rest of it.
+local CTL = {
+    open = { "cap", false, false }, close = { "cap", true, false }, transfer = { "cap", false, true },
+    destroy = { "cap", true, true }, takeAll = { "mesh", false, false },
+}
+local HINT_EVERY = 0.3
 
 local function hoveredCell()
     local body = CHEST.wrap and CHEST.wrap.body
@@ -1030,75 +1040,252 @@ local function interactionManager(pawn)
     return valid(m) and m or nil
 end
 
--- key: the item kind, or nil (Take All) for any.
-local function sendRequest(action, key)
-    local mgr = interactionManager(pawnOf(CHEST.pc))
-    if not mgr then log("could not reach the host"); return end
+sendCtl = function(action)
+    local pawn = pawnOf(CHEST.pc)
+    local mgr, f = interactionManager(pawn), CTL[action]
+    if not (mgr and f) then log("could not reach the host"); return end
     local col = nil
-    for k, g in pairs(CHEST.byKey) do
-        if key == nil or k == key then
-            for _, st in ipairs(g.stacks) do
-                local c, d = nil, nil
-                pcall(function() c = st.actor.InteractionCollision; d = st.actor.ItemData end)
-                if valid(c) and stackSize(st.actor) > 0 and fullName(d) == k then col = c; break end
-            end
-        end
-        if col then break end
-    end
-    if not col then return end
-    local f = REQUEST_FLAGS[action]
-    pcall(function() mgr:Server_RequestInteraction(nil, col, f[1], f[2]) end)
-    CHEST.nextScan = os.clock() + 0.3
+    pcall(function() col = (f[1] == "cap") and pawn.CapsuleComponent or pawn.Mesh end)
+    if not valid(col) then return end
+    pcall(function() mgr:Server_RequestInteraction(nil, col, f[2], f[3]) end)
 end
 
 local function clientInput()
-    local pc, now = CHEST.pc, os.clock()
+    local now = os.clock()
     if CHEST.clickReq then
         CHEST.clickReq = false
-        local i = hoveredCell()
-        if i and CHEST.slotKey[i] then sendRequest("transfer", CHEST.slotKey[i]) end
+        if hoveredCell() then sendCtl("transfer") end
     end
     if CHEST.takeAllReq then
         CHEST.takeAllReq = false
-        sendRequest("takeAll", nil)
+        sendCtl("takeAll")
     end
-    if keyDown(pc, KEY_X) then
-        local i = hoveredCell()
-        if i ~= CHEST.xCell then CHEST.xCell, CHEST.xStart, CHEST.xSent = i, now, false end
-        if i and not CHEST.xSent and now - CHEST.xStart >= DESTROY_HOLD and CHEST.slotKey[i] then
-            CHEST.xSent = true
-            sendRequest("destroy", CHEST.slotKey[i])
-        end
-    else
-        CHEST.xCell = nil
+    if keyDown(CHEST.pc, KEY_X) and now >= CHEST.xNext and hoveredCell() then
+        CHEST.xNext = now + HINT_EVERY
+        sendCtl("destroy")
     end
 end
 
--- Host side: requests from any player (the host's own forced-client tests included) are queued here and
--- carried out in the main tick, on that player's backpack.
+local function chestsOn(pawn)
+    local out, mine = {}, fullName(pawn)
+    local ok, all = pcall(FindAllOf, "InventoryComponent")
+    if not (mine and ok and all) then return out end
+    for _, c in ipairs(all) do
+        if valid(c) and not isDefault(c) then
+            local o = nil
+            pcall(function() o = c:GetOwner() end)
+            if o and fullName(o) == mine then out[#out + 1] = c end
+        end
+    end
+    return out
+end
+
+-- The chest the host built: an inventory on our character that was not there when we asked. Its items
+-- may arrive a moment after it does.
+local function arrivedChest()
+    local found = nil
+    for _, c in ipairs(chestsOn(pawnOf(CHEST.pc))) do
+        local name = fullName(c)
+        if name and not CHEST.known[name] then
+            local n = 0
+            pcall(function() n = c.ItemSlots:GetArrayNum() end)
+            if n > 0 or os.clock() - CHEST.sentAt > 1.0 then found = c end
+        end
+    end
+    return found
+end
+
+clientRefresh = function()
+    local byKey = {}
+    for _, g in ipairs(scanGround(pawnOf(CHEST.pc))) do byKey[g.key] = g end
+    CHEST.byKey, CHEST.slotKey = byKey, {}
+    if not valid(CHEST.comp) then return end
+    for i = 0, CHEST.slots - 1 do
+        local _, d, n = readSlot(CHEST.comp, i)
+        if d then
+            local key = fullName(d)
+            CHEST.slotKey[i] = key
+            -- This game only knows the ground near you; the host's chest can list items further away.
+            local g = byKey[key]
+            if g and g.total < n then g.total = n end
+        end
+    end
+    CHEST.total = chestTotal()
+end
+
+-- The replicated copy does not carry the slot count, which the window needs.
+local function attachChest(comp)
+    local n = 0
+    pcall(function() n = comp.ItemSlots:GetArrayNum() end)
+    n = math.ceil(math.max(n, cfg.VisibleRows * COLS) / COLS) * COLS
+    pcall(function() comp.MaxSlotCount = n; comp.bAllowAdds = false; comp.bSupportsSortAndFillStacks = false end)
+    local name = fullName(comp)
+    CHEST.known[name] = true
+    if CHEST.open then
+        unwrapScroll()
+        pcall(function() CHEST.api:CloseCurrentInventory() end)
+    end
+    CHEST.comp, CHEST.compName, CHEST.slots, CHEST.waitUntil = comp, name, n, nil
+    clientRefresh()
+    pcall(function() CHEST.api:ToggleInventory(comp) end)
+    CHEST.open = true
+    pcall(wrapScroll)
+end
+
+local function clientWait()
+    local now = os.clock()
+    if now < CHEST.nextLook then return end
+    CHEST.nextLook = now + 0.1
+    local c = arrivedChest()
+    if c then attachChest(c); return end
+    if now > CHEST.waitUntil then
+        log("the host did not send the chest (the host needs this version of the mod)")
+        closeChest(true)
+    end
+end
+
+-- The host replaces the chest when it needs more cells. False while there is no chest to use.
+local function clientSwap()
+    local now = os.clock()
+    local lost = not valid(CHEST.comp)
+    if lost or now >= CHEST.nextLook then
+        CHEST.nextLook = now + 0.5
+        local c = arrivedChest()
+        if c then attachChest(c); return false end
+    end
+    if lost then
+        unwrapScroll()
+        CHEST.open, CHEST.sentAt, CHEST.waitUntil = false, now, now + 3
+        return false
+    end
+    return true
+end
+
+-- Host side -------------------------------------------------------------------------------------------
+-- The host keeps one chest per player who opened it in its world. Each runs through the same code as the
+-- host's own chest: CHEST is pointed at that player's state while their chest is handled.
 local HOST = { queue = {} }
+local REMOTE = {}
+
+local function newState(pawn, pc)
+    return {
+        open = false, pc = pc, pawn = pawn, remote = true, client = false, comp = nil, compName = nil, slots = 0,
+        keyAt = {}, slotKey = {}, placed = {}, rep = {}, byKey = {}, bag = {}, total = 0, retired = {}, last = nil,
+        nextScan = 0, dirty = false, ctrlAt = -10, xAt = -10, takeAllAt = -10, painted = {},
+    }
+end
+
+local function withChest(st, fn)
+    local saved = CHEST
+    CHEST = st
+    local ok, err = pcall(fn)
+    CHEST = saved
+    if not ok then log("chest error: " .. tostring(err)) end
+end
+
+local function dropRemote(key)
+    local st = REMOTE[key]
+    if not st then return end
+    REMOTE[key] = nil
+    withChest(st, function()
+        for _, r in ipairs(CHEST.retired) do destroyChest(r.comp) end
+        if valid(CHEST.comp) then
+            pcall(function() CHEST.comp.bAllowAdds = true end)
+            emptyChest(CHEST.comp)
+            destroyChest(CHEST.comp)
+        end
+    end)
+end
+
+local function openRemote(pawn, pc)
+    local key = fullName(pawn)
+    dropRemote(key)
+    local st = newState(pawn, pc)
+    withChest(st, function()
+        if showChest(scanGround(pawn)) then CHEST.nextScan = os.clock() + cfg.RefreshSeconds end
+    end)
+    if valid(st.comp) then REMOTE[key] = st else log("could not build a chest for " .. tostring(key)) end
+end
+
+-- The game's move is settled as soon as the host sees it, which can be before the hint arrives. A hint
+-- that comes after its move is carried out on what that move left.
+local function hintRemote(st, action)
+    local now = os.clock()
+    if action == "transfer" then st.ctrlAt = now
+    elseif action == "destroy" then st.xAt = now
+    elseif action == "takeAll" then st.takeAllAt = now end
+    local L = st.last
+    if not L or now - L.at > 1.0 then return end
+    withChest(st, function()
+        if action == "transfer" and not L.transfer and next(L.moved) then
+            L.transfer = true
+            collectAll(CHEST.pc, L.moved)
+        elseif action == "takeAll" and not L.takeAll then
+            L.takeAll, L.transfer = true, true
+            collectAll(CHEST.pc, nil)
+        elseif action == "destroy" and not L.destroy and next(L.dropped) then
+            L.destroy = true
+            destroyAll(CHEST.pc, L.dropped)
+        else
+            return
+        end
+        CHEST.dirty = true
+    end)
+end
+
+-- fast: every frame, only settling moves (so a cell refills before its icon blinks out).
+local function remoteTick(fast)
+    for key, st in pairs(REMOTE) do
+        if not (valid(st.pawn) and valid(st.pc) and valid(st.comp)) then
+            dropRemote(key)
+        else
+            withChest(st, function()
+                local now = os.clock()
+                if chestTotal() ~= CHEST.total then
+                    settleChest()
+                    CHEST.nextScan = now + cfg.RefreshSeconds
+                elseif not fast then
+                    for i = #CHEST.retired, 1, -1 do
+                        if now >= CHEST.retired[i].at then
+                            destroyChest(CHEST.retired[i].comp)
+                            table.remove(CHEST.retired, i)
+                        end
+                    end
+                    if CHEST.dirty or now >= CHEST.nextScan then
+                        CHEST.dirty = false
+                        CHEST.nextScan = now + cfg.RefreshSeconds
+                        refreshChest()
+                    end
+                end
+            end)
+        end
+    end
+end
 
 pcall(RegisterHook, "/Script/Dominion.PlayerInteractionManager:Server_RequestInteraction", function(self, ic, col, sec, rel)
     local comp = nil
     pcall(function() comp = ic:get() end)
     if valid(comp) then return end
-    local mgr, c, pawn, item = nil, nil, nil, nil
+    local mgr, c, pawn = nil, nil, nil
     pcall(function() mgr = self:get() end)
     pcall(function() c = col:get() end)
     if not (valid(mgr) and valid(c)) then return end
     pcall(function() pawn = mgr:GetOwner() end)
-    pcall(function() item = c:GetOwner() end)
     local auth = false
     pcall(function() auth = pawn:HasAuthority() end)
-    if not (auth and valid(item)) then return end
+    if not auth then return end
+    local part = nil
+    pcall(function()
+        local n = fullName(c)
+        if n == fullName(pawn.CapsuleComponent) then part = "cap" elseif n == fullName(pawn.Mesh) then part = "mesh" end
+    end)
+    if not part then return end
     local s, r = false, false
     pcall(function() s = sec:get() end)
     pcall(function() r = rel:get() end)
-    local action = nil
-    for name, f in pairs(REQUEST_FLAGS) do if f[1] == s and f[2] == r then action = name end end
-    local key = nil
-    pcall(function() key = fullName(item.ItemData) end)
-    if action and key then HOST.queue[#HOST.queue + 1] = { pawn = pawn, action = action, key = key } end
+    for name, f in pairs(CTL) do
+        if f[1] == part and f[2] == s and f[3] == r then HOST.queue[#HOST.queue + 1] = { pawn = pawn, ctl = name } end
+    end
 end)
 
 local function serveRequests()
@@ -1106,27 +1293,33 @@ local function serveRequests()
     if #q == 0 then return end
     HOST.queue = {}
     for _, r in ipairs(q) do
-        local pc = nil
+        local pc, key = nil, fullName(r.pawn)
         pcall(function() pc = r.pawn.Controller end)
-        if valid(pc) then
-            if r.action == "transfer" then pcall(collectAll, pc, { [r.key] = true })
-            elseif r.action == "takeAll" then pcall(collectAll, pc, nil)
-            elseif r.action == "destroy" then pcall(destroyAll, pc, { [r.key] = true }) end
+        if valid(pc) and key then
+            if r.ctl == "open" then openRemote(r.pawn, pc)
+            elseif r.ctl == "close" then dropRemote(key)
+            elseif REMOTE[key] then hintRemote(REMOTE[key], r.ctl) end
         end
     end
-    CHEST.dirty = true
 end
 
 local function openChest()
-    if CHEST.open then return end
+    if CHEST.open or CHEST.waitUntil then return end
     local pc = localPC()
     if not valid(pc) then return end
     local api = firstLive("WorldActorInventoryUIAPI")
     if not valid(api) then log("chest window not available yet"); return end
     CHEST.client = CHEST.forceClient or not isHost(pc)
-    CHEST.clickReq, CHEST.takeAllReq, CHEST.xCell = false, false, nil
+    CHEST.clickReq, CHEST.takeAllReq, CHEST.xNext = false, false, 0
     CHEST.pc, CHEST.api = pc, api
     CHEST.keyAt, CHEST.byKey = {}, {}
+    if CHEST.client then
+        CHEST.known = {}
+        for _, c in ipairs(chestsOn(pawnOf(pc))) do CHEST.known[fullName(c)] = true end
+        CHEST.sentAt, CHEST.waitUntil, CHEST.nextLook = os.clock(), os.clock() + 5, 0
+        sendCtl("open")
+        return
+    end
     local groups = scanGround(pawnOf(pc))
     if not showChest(groups) then closeChest(true); return end
     CHEST.nextScan = os.clock() + cfg.RefreshSeconds
@@ -1134,6 +1327,7 @@ end
 
 -- Runs every tick while the chest is open.
 local function chestTick()
+    if CHEST.client and not clientSwap() then return end
     if not (valid(CHEST.comp) and valid(CHEST.api) and valid(CHEST.pc)) then closeChest(true); return end
     local shown, visible = nil, false
     pcall(function() shown = fullName(CHEST.api.InventoryComponent) end)
@@ -1147,7 +1341,7 @@ local function chestTick()
     if keyDown(pc, KEY_R) then CHEST.takeAllAt = now end
 
     if chestTotal() ~= CHEST.total then
-        if CHEST.client then refreshChest() else settleChest() end
+        if CHEST.client then clientRefresh() else settleChest() end
         CHEST.nextScan = now + cfg.RefreshSeconds
     elseif CHEST.dirty or now >= CHEST.nextScan then
         CHEST.dirty = false
@@ -1208,7 +1402,10 @@ pcall(RegisterHook, "/Script/Dominion.PlayerMagicComponent:Multicast_SendPayload
 end)
 
 -- New ground items mark the open chest dirty, so drops show up at once.
-pcall(NotifyOnNewObject, "/Script/Dominion.WorldItem", function() CHEST.dirty = true end)
+pcall(NotifyOnNewObject, "/Script/Dominion.WorldItem", function()
+    CHEST.dirty = true
+    for _, st in pairs(REMOTE) do st.dirty = true end
+end)
 
 -- Take All and Transfer are also caught as they happen, so a quick tap between ticks is not missed.
 pcall(RegisterKeyBind, Key.R, function()
@@ -1281,18 +1478,19 @@ local function tick()
     pcall(devPoll)
     if not ensureSpell() then return end
     serveRequests()
+    pcall(remoteTick, false)
     pcall(grantAll)
 
     local pc = localPC()
     if not valid(pc) then
-        if CHEST.open then closeChest(true) end
+        if CHEST.open or CHEST.waitUntil then closeChest(true) end
         P.setupDone, P.pcName = false, nil
         return
     end
     local name = fullName(pc)
     if name ~= P.pcName then
         P.pcName, P.setupDone, P.readyAt, P.sawLocked = name, false, os.clock() + 3, false
-        if CHEST.open then closeChest(true) end
+        if CHEST.open or CHEST.waitUntil then closeChest(true) end
     end
     if not P.setupDone and os.clock() >= P.readyAt then
         local ok, done = pcall(setupCharacter, pc)
@@ -1308,7 +1506,7 @@ local function tick()
         local f, l = runeCounts(pc)
         if f < CAST.fire or l < CAST.law then
             CAST.at = nil
-            if not CHEST.open then CHEST.pending = "open" end
+            if not (CHEST.open or CHEST.waitUntil) then CHEST.pending = "open" end
         elseif os.clock() - CAST.at > 6 then
             CAST.at = nil
         end
@@ -1322,7 +1520,7 @@ local function tick()
         closeChest(false)
     end
 
-    if CHEST.open then chestTick() end
+    if CHEST.open then chestTick() elseif CHEST.waitUntil then clientWait() end
 end
 
 local function mainTick()
@@ -1336,7 +1534,11 @@ end
 local okLoop = pcall(LoopInGameThreadWithDelay, 100, mainTick)
 if okLoop then
     pcall(LoopInGameThreadWithDelay, 1, function()
-        local ok, err = pcall(chestFastTick)
+        local ok, err = pcall(function()
+            serveRequests()
+            remoteTick(true)
+            chestFastTick()
+        end)
         if not ok then
             tickErrors = tickErrors + 1
             if tickErrors <= 5 then log("fast tick error: " .. tostring(err)) end
