@@ -1,0 +1,30 @@
+# Manage Fallen Items - settings. Restart the game after changing anything here.
+
+# Spell cost (minimum 1 of each).
+FireRunes = 15
+LawRunes = 15
+
+# Seconds before the spell can be cast again.
+CooldownSeconds = 2
+
+# Put the spell in the first empty spell-wheel slot the first time a character gets it.
+AddToSpellWheel = true
+
+# How often (seconds) the open chest re-reads the ground. New drops also show up instantly.
+RefreshSeconds = 1.0
+
+# Destroying never destroys quest / key items.
+ProtectQuestItems = true
+
+# Rows of cells (8 per row) shown before the chest scrolls. 5 = the size of a 40-slot chest.
+VisibleRows = 5
+
+# Transfer (Ctrl+click) and Take All fill the backpack and, like any chest, can leave you encumbered.
+# true = stop before you would become encumbered instead.
+StopAtCarryWeight = false
+
+# Optional hotkey that opens the chest without casting (no runes spent), e.g. CTRL+G or F7. "none" = off.
+OpenKey = none
+
+# Development only.
+DevCommandFile = false
